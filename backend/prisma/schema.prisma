@@ -1,0 +1,159 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Top-level restaurant
+model Restaurant {
+  id          Int           @id @default(autoincrement())
+  name        String
+  slug        String        @unique
+  description String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  tables      Table[]
+  categories  MenuCategory[]
+  items       MenuItem[]
+  orders      Order[]
+}
+
+// Physical tables in the restaurant
+model Table {
+  id            Int         @id @default(autoincrement())
+  restaurantId  Int
+  name          String      // e.g. "Table 11"
+  area          String?     // e.g. "Indoor", "Outdoor"
+  qrToken       String      @unique
+  capacity      Int?
+  isActive      Boolean     @default(true)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  restaurant    Restaurant  @relation(fields: [restaurantId], references: [id])
+  orders        Order[]
+}
+
+// Menu categories (Starters, Main Course, Desserts, etc.)
+model MenuCategory {
+  id            Int         @id @default(autoincrement())
+  restaurantId  Int
+  name          String
+  slug          String      @unique
+  displayOrder  Int         @default(0)
+  isActive      Boolean     @default(true)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  restaurant    Restaurant  @relation(fields: [restaurantId], references: [id])
+  items         MenuItem[]
+}
+
+// Menu items (individual dishes)
+model MenuItem {
+  id            Int           @id @default(autoincrement())
+  restaurantId  Int
+  categoryId    Int?
+  name          String
+  description   String?
+  basePrice     Decimal
+  isVeg         Boolean       @default(true)
+  spiceLevel    Int?          // 0–3, etc.
+  imageUrl      String?
+  tags          String[]      // e.g. ["chef_special", "kids"]
+  isActive      Boolean       @default(true)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  restaurant    Restaurant    @relation(fields: [restaurantId], references: [id])
+  category      MenuCategory? @relation(fields: [categoryId], references: [id])
+  variations    ItemVariation[]
+  addons        ItemAddon[]
+  orderItems    OrderItem[]
+}
+
+// Variations (Half/Full, Small/Medium/Large)
+model ItemVariation {
+  id        Int       @id @default(autoincrement())
+  itemId    Int
+  name      String    // e.g. "Half", "Full"
+  priceDelta Decimal // +/- relative to basePrice
+
+  item      MenuItem  @relation(fields: [itemId], references: [id])
+  orderItems OrderItem[]
+}
+
+// Add-ons (Extra cheese, No onion, etc.)
+model ItemAddon {
+  id        Int      @id @default(autoincrement())
+  itemId    Int
+  name      String
+  priceDelta Decimal
+  maxQuantity Int?    // e.g. max 3 extra cheese
+
+  item      MenuItem @relation(fields: [itemId], references: [id])
+}
+
+// Orders per table
+model Order {
+  id            Int          @id @default(autoincrement())
+  restaurantId  Int
+  tableId       Int
+  status        OrderStatus  @default(PENDING)
+  subtotal      Decimal
+  tax           Decimal
+  total         Decimal
+  paymentStatus PaymentStatus @default(UNPAID)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  restaurant    Restaurant   @relation(fields: [restaurantId], references: [id])
+  table         Table        @relation(fields: [tableId], references: [id])
+  items         OrderItem[]
+  feedback      Feedback?
+}
+
+// Items inside an order
+model OrderItem {
+  id           Int          @id @default(autoincrement())
+  orderId      Int
+  itemId       Int
+  variationId  Int?
+  quantity     Int
+  unitPrice    Decimal       // final unit price used for billing
+  addons       Json         // structured addon info: [{addonId, qty, priceDelta}]
+  specialNotes String?
+
+  order        Order        @relation(fields: [orderId], references: [id])
+  item         MenuItem     @relation(fields: [itemId], references: [id])
+  variation    ItemVariation? @relation(fields: [variationId], references: [id])
+}
+
+// Feedback per order
+model Feedback {
+  id        Int      @id @default(autoincrement())
+  orderId   Int      @unique
+  rating    Int      // 1–5
+  comments  String?
+  createdAt DateTime @default(now())
+
+  order     Order    @relation(fields: [orderId], references: [id])
+}
+
+enum OrderStatus {
+  PENDING
+  ACCEPTED
+  IN_KITCHEN
+  SERVED
+  CLOSED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PAID
+  REFUNDED
+}

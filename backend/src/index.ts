@@ -4,6 +4,26 @@ import cors from 'cors';
 import { PrismaClient, Prisma } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 
+interface OrderAddonInput {
+  addonId: number;
+  quantity: number;
+}
+
+interface OrderItemInput {
+  itemId: number;
+  variationId?: number;
+  quantity: number;
+  addons?: OrderAddonInput[];
+  specialNotes?: string;
+}
+
+interface CreateOrderBody {
+  restaurantSlug: string;
+  tableQrToken?: string;
+  tableId?: number;
+  items: OrderItemInput[];
+}
+
 const app = express();
 
 const adapter = new PrismaPg({
@@ -138,6 +158,274 @@ app.get('/public/restaurants/:restaurantSlug/menu', async (req: Request, res: Re
     });
   } catch (err) {
     console.error('Error fetching menu:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create a new order for a table
+app.post('/public/orders', async (req: Request, res: Response) => {
+  const body = req.body as CreateOrderBody;
+
+  try {
+    // Basic validation
+    if (!body.restaurantSlug) {
+      return res.status(400).json({ error: 'restaurantSlug is required' });
+    }
+    if ((!body.tableQrToken && !body.tableId) || !body.items || body.items.length === 0) {
+      return res.status(400).json({ error: 'tableQrToken or tableId and items are required' });
+    }
+
+    // 1. Resolve restaurant
+    const restaurant = await prisma.restaurant.findUnique({
+      where: { slug: body.restaurantSlug },
+    });
+
+    if (!restaurant) {
+      return res.status(404).json({ error: 'Restaurant not found' });
+    }
+
+    // 2. Resolve table (by QR token or by ID)
+    let table = null;
+
+    if (body.tableId) {
+      table = await prisma.table.findFirst({
+        where: {
+          id: body.tableId,
+          restaurantId: restaurant.id,
+        },
+      });
+    } else if (body.tableQrToken) {
+      table = await prisma.table.findFirst({
+        where: {
+          qrToken: body.tableQrToken,
+          restaurantId: restaurant.id,
+        },
+      });
+    }
+
+    if (!table) {
+      return res.status(404).json({ error: 'Table not found for this restaurant' });
+    }
+
+    // 3. Load menu items, variations, and addons needed to compute prices
+    const itemIds = body.items.map((i) => i.itemId);
+    const menuItems = await prisma.menuItem.findMany({
+      where: {
+        id: { in: itemIds },
+        restaurantId: restaurant.id,
+        isActive: true,
+      },
+      include: {
+        variations: true,
+        addons: true,
+      },
+    });
+
+    // Map for quick lookup
+    const menuItemMap = new Map<number, (typeof menuItems)[number]>();
+    menuItems.forEach((mi) => menuItemMap.set(mi.id, mi));
+
+    // 4. Compute subtotal, tax, total and prepare OrderItem data
+    const TAX_RATE = Number(process.env.ORDER_TAX_RATE || '0.05');
+    type ComputedOrderItem = {
+      itemId: number;
+      variationId?: number;
+      quantity: number;
+      unitPrice: number;
+      addonsJson: any;
+      specialNotes?: string;
+    };
+
+    const computedItems: ComputedOrderItem[] = [];
+    let subtotal = 0;
+
+    for (const inputItem of body.items) {
+      const menuItem = menuItemMap.get(inputItem.itemId);
+      if (!menuItem) {
+        return res.status(400).json({ error: `Menu item ${inputItem.itemId} not found or inactive` });
+      }
+
+      // Base price
+      let unitPrice = Number(menuItem.basePrice); // Prisma Decimal -> number
+
+      // Variation
+      let variationId: number | undefined = undefined;
+      if (inputItem.variationId) {
+        const variation = menuItem.variations.find((v) => v.id === inputItem.variationId);
+        if (!variation) {
+          return res.status(400).json({ error: `Variation ${inputItem.variationId} not found for item ${inputItem.itemId}` });
+        }
+        unitPrice += Number(variation.priceDelta);
+        variationId = variation.id;
+      }
+
+      // Addons
+      const addonPayload: OrderAddonInput[] = [];
+      if (inputItem.addons && inputItem.addons.length > 0) {
+        for (const addonInput of inputItem.addons) {
+          const addon = menuItem.addons.find((a) => a.id === addonInput.addonId);
+          if (!addon) {
+            return res.status(400).json({ error: `Addon ${addonInput.addonId} not found for item ${inputItem.itemId}` });
+          }
+          unitPrice += Number(addon.priceDelta) * addonInput.quantity;
+          addonPayload.push({
+            addonId: addon.id,
+            quantity: addonInput.quantity,
+          });
+        }
+      }
+
+      subtotal += unitPrice * inputItem.quantity;
+
+      computedItems.push({
+        itemId: menuItem.id,
+        variationId,
+        quantity: inputItem.quantity,
+        unitPrice,
+        addonsJson: addonPayload,
+        specialNotes: inputItem.specialNotes,
+      });
+    }
+
+    const tax = Number((subtotal * TAX_RATE).toFixed(2));
+    const total = Number((subtotal + tax).toFixed(2));
+
+    // 5. Create order with nested items
+    const order = await prisma.order.create({
+      data: {
+        restaurantId: restaurant.id,
+        tableId: table.id,
+        status: 'PENDING',
+        subtotal,
+        tax,
+        total,
+        paymentStatus: 'UNPAID',
+        items: {
+          create: computedItems.map((ci) => ({
+            itemId: ci.itemId,
+            variationId: ci.variationId,
+            quantity: ci.quantity,
+            unitPrice: ci.unitPrice,
+            addons: ci.addonsJson, // stored as JSON
+            specialNotes: ci.specialNotes,
+          })),
+        },
+      },
+      include: {
+        items: true,
+        table: true,
+        restaurant: true,
+      },
+    });
+
+    // 6. Respond with order summary
+    res.status(201).json({
+      order: {
+        id: order.id,
+        status: order.status,
+        subtotal: order.subtotal,
+        tax: order.tax,
+        total: order.total,
+        paymentStatus: order.paymentStatus,
+        table: {
+          id: order.table.id,
+          name: order.table.name,
+        },
+        restaurant: {
+          id: order.restaurant.id,
+          name: order.restaurant.name,
+          slug: order.restaurant.slug,
+        },
+        items: order.items,
+      },
+    });
+  } catch (err) {
+    console.error('Error creating order:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get order status and details
+app.get('/public/orders/:id', async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+
+  if (Number.isNaN(id)) {
+    return res.status(400).json({ error: 'Invalid order id' });
+  }
+
+  try {
+    const order = await prisma.order.findUnique({
+      where: { id },
+      include: {
+        items: {
+          include: {
+            item: true,
+            variation: true,
+          },
+        },
+        table: true,
+        restaurant: true,
+      },
+    });
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    res.json({
+      id: order.id,
+      status: order.status,
+      paymentStatus: order.paymentStatus,
+      subtotal: order.subtotal,
+      tax: order.tax,
+      total: order.total,
+      createdAt: order.createdAt,
+      table: {
+        id: order.table.id,
+        name: order.table.name,
+      },
+      restaurant: {
+        id: order.restaurant.id,
+        name: order.restaurant.name,
+        slug: order.restaurant.slug,
+      },
+      items: order.items.map((oi) => ({
+        id: oi.id,
+        name: oi.item.name,
+        quantity: oi.quantity,
+        unitPrice: oi.unitPrice,
+        variation: oi.variation?.name ?? null,
+        addons: oi.addons,
+        specialNotes: oi.specialNotes,
+      })),
+    });
+  } catch (err) {
+    console.error('Error fetching order:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update order status (staff use)
+app.patch('/admin/orders/:id/status', async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const { status } = req.body as { status: 'PENDING' | 'ACCEPTED' | 'IN_KITCHEN' | 'SERVED' | 'CLOSED' | 'CANCELLED' };
+
+  if (Number.isNaN(id)) {
+    return res.status(400).json({ error: 'Invalid order id' });
+  }
+  if (!status) {
+    return res.status(400).json({ error: 'status is required' });
+  }
+
+  try {
+    const order = await prisma.order.update({
+      where: { id },
+      data: { status },
+    });
+
+    res.json({ id: order.id, status: order.status });
+  } catch (err) {
+    console.error('Error updating order status:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

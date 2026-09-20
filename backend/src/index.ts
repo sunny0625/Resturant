@@ -1,10 +1,13 @@
 import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import cors from 'cors';
-import { PrismaClient, Prisma } from '@prisma/client';
+import helmet from 'helmet';
+import { PrismaClient, Prisma, OrderStatus } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 import type { CreateOrderBody, OrderAddonInput } from './types';
 import { createOrderSchema } from './validation/orderValidation';
+import { adminAuth } from './middleware/auth';
+import { errorHandler } from './middleware/errorHandler';
 
 const app = express();
 
@@ -18,8 +21,30 @@ const prisma = new PrismaClient({
 
 const PORT = process.env.PORT || 4000;
 
+type CreatedOrder = Prisma.OrderGetPayload<{
+  include: {
+    items: true;
+    table: true;
+    restaurant: true;
+  };
+}>;
+
+type OrderWithDetails = Prisma.OrderGetPayload<{
+  include: {
+    items: {
+      include: {
+        item: true;
+        variation: true;
+      };
+    };
+    table: true;
+    restaurant: true;
+  };
+}>;
+
 // Middleware
 app.use(cors());
+app.use(helmet());
 app.use(express.json());
 
 // Health check
@@ -47,6 +72,13 @@ app.get('/public/qr/:qrToken', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Table not found for this QR' });
     }
 
+    console.log({
+      action: 'qr_resolved',
+      qrToken,
+      tableId: table.id,
+      restaurantSlug: table.restaurant.slug,
+    });
+
     res.json({
       table: {
         id: table.id,
@@ -59,8 +91,8 @@ app.get('/public/qr/:qrToken', async (req: Request, res: Response) => {
         slug: table.restaurant.slug,
       },
     });
-  } catch (err) {
-    console.error('Error resolving QR:', err);
+    } catch (err) {
+      console.error('Error resolving QR:', { qrToken, err });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -141,7 +173,7 @@ app.get(
         })),
       });
     } catch (err) {
-      console.error('Error fetching menu:', err);
+      console.error('Error fetching menu:', { restaurantSlug, err });
       res.status(500).json({ error: 'Internal server error' });
     }
   }
@@ -158,6 +190,7 @@ app.post('/public/orders', async (req: Request, res: Response) => {
     });
   }
   const body = parseResult.data as CreateOrderBody;
+  let resolvedTableId: number | undefined;
 
   try {
     // Basic validation (still useful for business rules)
@@ -210,6 +243,8 @@ app.post('/public/orders', async (req: Request, res: Response) => {
         .json({ error: 'Table not found for this restaurant' });
     }
 
+
+    resolvedTableId = table?.id;
     // 3. Load menu items, variations, and addons needed to compute prices
     const itemIds = body.items.map((i) => i.itemId);
     const menuItems = await prisma.menuItem.findMany({
@@ -228,8 +263,9 @@ app.post('/public/orders', async (req: Request, res: Response) => {
     const menuItemMap = new Map<number, (typeof menuItems)[number]>();
     menuItems.forEach((mi) => menuItemMap.set(mi.id, mi));
 
-    // 4. Compute subtotal, tax, total and prepare OrderItem data
-    const TAX_RATE = Number(process.env.ORDER_TAX_RATE || '0.05');
+    // 4. Compute subtotal, tax, service charge, total and prepare OrderItem data
+    const taxRate = Number(restaurant.taxRate ?? 0);
+    const serviceRate = Number(restaurant.serviceChargeRate ?? 0);
     type ComputedOrderItem = {
       itemId: number;
       variationId?: number;
@@ -301,17 +337,19 @@ app.post('/public/orders', async (req: Request, res: Response) => {
       });
     }
 
-    const tax = Number((subtotal * TAX_RATE).toFixed(2));
-    const total = Number((subtotal + tax).toFixed(2));
+    const tax = Number((subtotal * taxRate).toFixed(2));
+    const serviceCharge = Number((subtotal * serviceRate).toFixed(2));
+    const total = Number((subtotal + tax + serviceCharge).toFixed(2));
 
     // 5. Create order with nested items
-    const order = await prisma.order.create({
+    const order = (await prisma.order.create({
       data: {
         restaurantId: restaurant.id,
         tableId: table.id,
         status: 'PENDING',
         subtotal,
         tax,
+        serviceCharge,
         total,
         paymentStatus: 'UNPAID',
         items: {
@@ -322,7 +360,7 @@ app.post('/public/orders', async (req: Request, res: Response) => {
             unitPrice: ci.unitPrice,
             addons: ci.addonsJson, // stored as JSON
             specialNotes: ci.specialNotes,
-          })),
+          })) as unknown as Prisma.OrderItemUncheckedCreateWithoutOrderInput[],
         },
       },
       include: {
@@ -330,6 +368,17 @@ app.post('/public/orders', async (req: Request, res: Response) => {
         table: true,
         restaurant: true,
       },
+    })) as CreatedOrder;
+
+    console.log({
+      action: 'order_created',
+      orderId: order.id,
+      tableId: table.id,
+      restaurantSlug: restaurant.slug,
+      subtotal,
+      tax,
+      serviceCharge,
+      total,
     });
 
     // 6. Respond with order summary
@@ -339,6 +388,7 @@ app.post('/public/orders', async (req: Request, res: Response) => {
         status: order.status,
         subtotal: order.subtotal,
         tax: order.tax,
+        serviceCharge: order.serviceCharge,
         total: order.total,
         paymentStatus: order.paymentStatus,
         table: {
@@ -354,7 +404,11 @@ app.post('/public/orders', async (req: Request, res: Response) => {
       },
     });
   } catch (err) {
-    console.error('Error creating order:', err);
+    console.error('Error creating order:', {
+      restaurantSlug: body.restaurantSlug,
+      tableId: resolvedTableId,
+      err,
+    });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -368,7 +422,7 @@ app.get('/public/orders/:id', async (req: Request, res: Response) => {
   }
 
   try {
-    const order = await prisma.order.findUnique({
+    const order = (await prisma.order.findUnique({
       where: { id },
       include: {
         items: {
@@ -380,7 +434,7 @@ app.get('/public/orders/:id', async (req: Request, res: Response) => {
         table: true,
         restaurant: true,
       },
-    });
+    })) as OrderWithDetails | null;
 
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
@@ -392,6 +446,7 @@ app.get('/public/orders/:id', async (req: Request, res: Response) => {
       paymentStatus: order.paymentStatus,
       subtotal: order.subtotal,
       tax: order.tax,
+      serviceCharge: order.serviceCharge,
       total: order.total,
       createdAt: order.createdAt,
       table: {
@@ -414,7 +469,7 @@ app.get('/public/orders/:id', async (req: Request, res: Response) => {
       })),
     });
   } catch (err) {
-    console.error('Error fetching order:', err);
+    console.error('Error fetching order:', { orderId: id, err });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -422,6 +477,7 @@ app.get('/public/orders/:id', async (req: Request, res: Response) => {
 // Update order status (staff use)
 app.patch(
   '/admin/orders/:id/status',
+  adminAuth,
   async (req: Request, res: Response) => {
     const id = Number(req.params.id);
     const { status } = req.body as {
@@ -447,17 +503,18 @@ app.patch(
         data: { status },
       });
 
+      console.log({ action: 'order_status_updated', orderId: id, status });
       res.json({ id: order.id, status: order.status });
     } catch (err) {
-      console.error('Error updating order status:', err);
+      console.error('Error updating order status:', { orderId: id, status, err });
       res.status(500).json({ error: 'Internal server error' });
     }
   }
 );
 
 // List orders by status for staff
-app.get('/admin/orders', async (req: Request, res: Response) => {
-  const status = (req.query.status as string) || 'PENDING';
+app.get('/admin/orders', adminAuth, async (req: Request, res: Response) => {
+  const status = ((req.query.status as string) || 'PENDING') as OrderStatus;
 
   try {
     const orders = await prisma.order.findMany({
@@ -466,6 +523,12 @@ app.get('/admin/orders', async (req: Request, res: Response) => {
       include: {
         table: true,
         restaurant: true,
+        items: {
+          include: {
+            item: true,
+            variation: true,
+          },
+        },
       },
     });
 
@@ -477,15 +540,28 @@ app.get('/admin/orders', async (req: Request, res: Response) => {
         createdAt: o.createdAt,
         tableName: o.table.name,
         restaurantName: o.restaurant.name,
+        items: o.items.map((item) => ({
+          id: item.id,
+          name: item.item.name,
+          quantity: item.quantity,
+          variation: item.variation?.name ?? null,
+          addons: item.addons,
+          specialNotes: item.specialNotes,
+        })),
       }))
     );
   } catch (err) {
-    console.error('Error listing orders:', err);
+    console.error('Error listing orders:', { status, err });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Backend server running at http://localhost:${PORT}`);
-});
+app.use(errorHandler);
+
+export { app };
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log({ action: 'server_started', port: PORT });
+  });
+}

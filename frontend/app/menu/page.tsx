@@ -1,7 +1,7 @@
 'use client';
 
-import { useSearchParams } from 'next/navigation';
 import { useEffect, useState } from 'react';
+import { useOrderStore } from '@/store/useOrderStore';
 
 type MenuItem = {
   id: number;
@@ -23,50 +23,39 @@ type Category = {
   items: MenuItem[];
 };
 
-type CartItem = {
-  itemId: number;
-  variationId?: number;
-  quantity: number;
-  addons?: { addonId: number; quantity: number }[];
-  specialNotes?: string;
-};
-
 export default function MenuPage() {
-  const searchParams = useSearchParams();
-  const slug = searchParams.get('slug');
-  const qr = searchParams.get('qr');
+  const restaurantSlug = useOrderStore((s) => s.restaurantSlug);
+  const tableQrToken = useOrderStore((s) => s.tableQrToken);
+  const addItemToCart = useOrderStore((s) => s.addItem);
+  const cartItems = useOrderStore((s) => s.cartItems);
 
   const [categories, setCategories] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);
-  const [cart, setCart] = useState<CartItem[]>([]);
 
   useEffect(() => {
     async function loadMenu() {
-      if (!slug) return;
+      if (!restaurantSlug) return;
       const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL!;
-      const res = await fetch(`${baseUrl}/public/restaurants/${slug}/menu`);
+      const res = await fetch(
+        `${baseUrl}/public/restaurants/${restaurantSlug}/menu`
+      );
       const data = await res.json();
       setCategories(data.categories);
       setLoading(false);
     }
     loadMenu();
-  }, [slug]);
+  }, [restaurantSlug]);
 
-  function addToCart(itemId: number, variationId?: number) {
-    setCart((prev) => {
-      const existing = prev.find(
-        (ci) => ci.itemId === itemId && ci.variationId === variationId
-      );
-      if (existing) {
-        return prev.map((ci) =>
-          ci === existing ? { ...ci, quantity: ci.quantity + 1 } : ci
-        );
-      }
-      return [...prev, { itemId, variationId, quantity: 1 }];
+  function addToCart(itemId: number) {
+    addItemToCart({
+      itemId,
+      quantity: 1,
     });
   }
 
-  // For now, keep addons and notes simple; you can add modals later.
+  if (!restaurantSlug || !tableQrToken) {
+    return <p>Missing context. Please scan the QR again.</p>;
+  }
 
   if (loading) {
     return <p>Loading menu...</p>;
@@ -74,9 +63,8 @@ export default function MenuPage() {
 
   return (
     <main>
-      <h1>Menu</h1>
-      <p>Restaurant: {slug}</p>
-      <p>Table QR: {qr}</p>
+      <h1>Menu – {restaurantSlug}</h1>
+      <p>Table QR token: {tableQrToken}</p>
 
       {categories.map((cat) => (
         <section key={cat.id}>
@@ -85,19 +73,14 @@ export default function MenuPage() {
             <div key={item.id}>
               <h3>{item.name}</h3>
               <p>{item.description}</p>
-              <p>Base price: ₹{item.basePrice}</p>
+              <p>₹{item.basePrice}</p>
               <button onClick={() => addToCart(item.id)}>Add</button>
             </div>
           ))}
         </section>
       ))}
 
-      <a
-        href={`/cart?slug=${slug}&qr=${qr}`}
-        style={{ display: 'block', marginTop: '1rem' }}
-      >
-        Go to Cart ({cart.reduce((sum, ci) => sum + ci.quantity, 0)} items)
-      </a>
+      <a href="/cart">Go to Cart ({cartItems.reduce((sum, ci) => sum + ci.quantity, 0)} items)</a>
     </main>
   );
 }

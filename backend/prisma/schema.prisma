@@ -8,12 +8,14 @@ datasource db {
 
 // Top-level restaurant
 model Restaurant {
-  id          Int           @id @default(autoincrement())
-  name        String
-  slug        String        @unique
-  description String?
-  createdAt   DateTime      @default(now())
-  updatedAt   DateTime      @updatedAt
+  id                 Int           @id @default(autoincrement())
+  name               String
+  slug               String        @unique
+  description        String?
+  taxRate            Decimal       @db.Decimal(5, 4) @default(0.0500)
+  serviceChargeRate  Decimal       @db.Decimal(5, 4) @default(0.0000)
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
 
   tables      Table[]
   categories  MenuCategory[]
@@ -105,6 +107,7 @@ model Order {
   status        OrderStatus  @default(PENDING)
   subtotal      Decimal
   tax           Decimal
+  serviceCharge Decimal
   total         Decimal
   paymentStatus PaymentStatus @default(UNPAID)
   createdAt     DateTime     @default(now())

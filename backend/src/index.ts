@@ -3,26 +3,8 @@ import express, { Request, Response } from 'express';
 import cors from 'cors';
 import { PrismaClient, Prisma } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
-
-interface OrderAddonInput {
-  addonId: number;
-  quantity: number;
-}
-
-interface OrderItemInput {
-  itemId: number;
-  variationId?: number;
-  quantity: number;
-  addons?: OrderAddonInput[];
-  specialNotes?: string;
-}
-
-interface CreateOrderBody {
-  restaurantSlug: string;
-  tableQrToken?: string;
-  tableId?: number;
-  items: OrderItemInput[];
-}
+import type { CreateOrderBody, OrderAddonInput } from './types';
+import { createOrderSchema } from './validation/orderValidation';
 
 const app = express();
 
@@ -84,95 +66,114 @@ app.get('/public/qr/:qrToken', async (req: Request, res: Response) => {
 });
 
 // Public menu for a restaurant
-app.get('/public/restaurants/:restaurantSlug/menu', async (req: Request, res: Response) => {
-  const restaurantSlug = req.params.restaurantSlug as string; // ensure plain string
+app.get(
+  '/public/restaurants/:restaurantSlug/menu',
+  async (req: Request, res: Response) => {
+    const restaurantSlug = req.params.restaurantSlug as string; // ensure plain string
 
-  try {
-    type RestaurantWithMenu = Prisma.RestaurantGetPayload<{
-      include: {
-        categories: {
-          where?: { isActive?: boolean };
-          orderBy?: { displayOrder: 'asc' };
-          include: {
-            items: {
-              where?: { isActive?: boolean };
-              orderBy?: { name: 'asc' };
-              include: {
-                variations: true;
-                addons: true;
+    try {
+      type RestaurantWithMenu = Prisma.RestaurantGetPayload<{
+        include: {
+          categories: {
+            where?: { isActive?: boolean };
+            orderBy?: { displayOrder: 'asc' };
+            include: {
+              items: {
+                where?: { isActive?: boolean };
+                orderBy?: { name: 'asc' };
+                include: {
+                  variations: true;
+                  addons: true;
+                };
               };
             };
           };
         };
-      };
-    }>;
+      }>;
 
-    const restaurant = (await prisma.restaurant.findUnique({
-      where: { slug: restaurantSlug },
-      include: {
-        categories: {
-          where: { isActive: true },
-          orderBy: { displayOrder: 'asc' },
-          include: {
-            items: {
-              where: { isActive: true },
-              orderBy: { name: 'asc' },
-              include: {
-                variations: true,
-                addons: true,
+      const restaurant = (await prisma.restaurant.findUnique({
+        where: { slug: restaurantSlug },
+        include: {
+          categories: {
+            where: { isActive: true },
+            orderBy: { displayOrder: 'asc' },
+            include: {
+              items: {
+                where: { isActive: true },
+                orderBy: { name: 'asc' },
+                include: {
+                  variations: true,
+                  addons: true,
+                },
               },
             },
           },
         },
-      },
-    })) as RestaurantWithMenu | null;
+      })) as RestaurantWithMenu | null;
 
-    if (!restaurant) {
-      return res.status(404).json({ error: 'Restaurant not found' });
-    }
+      if (!restaurant) {
+        return res.status(404).json({ error: 'Restaurant not found' });
+      }
 
-    res.json({
-      restaurant: {
-        id: restaurant.id,
-        name: restaurant.name,
-        slug: restaurant.slug,
-        description: restaurant.description,
-      },
-      categories: restaurant.categories.map((cat) => ({
-        id: cat.id,
-        name: cat.name,
-        slug: cat.slug,
-        items: cat.items.map((item) => ({
-          id: item.id,
-          name: item.name,
-          description: item.description,
-          basePrice: item.basePrice,
-          isVeg: item.isVeg,
-          spiceLevel: item.spiceLevel,
-          imageUrl: item.imageUrl,
-          tags: item.tags,
-          variations: item.variations,
-          addons: item.addons,
+      res.json({
+        restaurant: {
+          id: restaurant.id,
+          name: restaurant.name,
+          slug: restaurant.slug,
+          description: restaurant.description,
+        },
+        categories: restaurant.categories.map((cat) => ({
+          id: cat.id,
+          name: cat.name,
+          slug: cat.slug,
+          items: cat.items.map((item) => ({
+            id: item.id,
+            name: item.name,
+            description: item.description,
+            basePrice: item.basePrice,
+            isVeg: item.isVeg,
+            spiceLevel: item.spiceLevel,
+            imageUrl: item.imageUrl,
+            tags: item.tags,
+            variations: item.variations,
+            addons: item.addons,
+          })),
         })),
-      })),
-    });
-  } catch (err) {
-    console.error('Error fetching menu:', err);
-    res.status(500).json({ error: 'Internal server error' });
+      });
+    } catch (err) {
+      console.error('Error fetching menu:', err);
+      res.status(500).json({ error: 'Internal server error' });
+    }
   }
-});
+);
 
 // Create a new order for a table
 app.post('/public/orders', async (req: Request, res: Response) => {
-  const body = req.body as CreateOrderBody;
+  // Validate body against schema, then use typed data
+  const parseResult = createOrderSchema.safeParse(req.body);
+  if (!parseResult.success) {
+    return res.status(400).json({
+      error: 'Invalid payload',
+      details: parseResult.error.issues,
+    });
+  }
+  const body = parseResult.data as CreateOrderBody;
 
   try {
-    // Basic validation
+    // Basic validation (still useful for business rules)
     if (!body.restaurantSlug) {
-      return res.status(400).json({ error: 'restaurantSlug is required' });
+      return res
+        .status(400)
+        .json({ error: 'restaurantSlug is required' });
     }
-    if ((!body.tableQrToken && !body.tableId) || !body.items || body.items.length === 0) {
-      return res.status(400).json({ error: 'tableQrToken or tableId and items are required' });
+    if (
+      (!body.tableQrToken && !body.tableId) ||
+      !body.items ||
+      body.items.length === 0
+    ) {
+      return res.status(400).json({
+        error: 'tableQrToken or tableId and items are required',
+      });
     }
 
     // 1. Resolve restaurant
@@ -204,7 +205,9 @@ app.post('/public/orders', async (req: Request, res: Response) => {
     }
 
     if (!table) {
-      return res.status(404).json({ error: 'Table not found for this restaurant' });
+      return res
+        .status(404)
+        .json({ error: 'Table not found for this restaurant' });
     }
 
     // 3. Load menu items, variations, and addons needed to compute prices
@@ -232,7 +235,7 @@ app.post('/public/orders', async (req: Request, res: Response) => {
       variationId?: number;
       quantity: number;
       unitPrice: number;
-      addonsJson: any;
+      addonsJson: OrderAddonInput[];
       specialNotes?: string;
     };
 
@@ -242,7 +245,9 @@ app.post('/public/orders', async (req: Request, res: Response) => {
     for (const inputItem of body.items) {
       const menuItem = menuItemMap.get(inputItem.itemId);
       if (!menuItem) {
-        return res.status(400).json({ error: `Menu item ${inputItem.itemId} not found or inactive` });
+        return res.status(400).json({
+          error: `Menu item ${inputItem.itemId} not found or inactive`,
+        });
       }
 
       // Base price
@@ -251,9 +256,13 @@ app.post('/public/orders', async (req: Request, res: Response) => {
       // Variation
       let variationId: number | undefined = undefined;
       if (inputItem.variationId) {
-        const variation = menuItem.variations.find((v) => v.id === inputItem.variationId);
+        const variation = menuItem.variations.find(
+          (v) => v.id === inputItem.variationId
+        );
         if (!variation) {
-          return res.status(400).json({ error: `Variation ${inputItem.variationId} not found for item ${inputItem.itemId}` });
+          return res.status(400).json({
+            error: `Variation ${inputItem.variationId} not found for item ${inputItem.itemId}`,
+          });
         }
         unitPrice += Number(variation.priceDelta);
         variationId = variation.id;
@@ -263,11 +272,16 @@ app.post('/public/orders', async (req: Request, res: Response) => {
       const addonPayload: OrderAddonInput[] = [];
       if (inputItem.addons && inputItem.addons.length > 0) {
         for (const addonInput of inputItem.addons) {
-          const addon = menuItem.addons.find((a) => a.id === addonInput.addonId);
+          const addon = menuItem.addons.find(
+            (a) => a.id === addonInput.addonId
+          );
           if (!addon) {
-            return res.status(400).json({ error: `Addon ${addonInput.addonId} not found for item ${inputItem.itemId}` });
+            return res.status(400).json({
+              error: `Addon ${addonInput.addonId} not found for item ${inputItem.itemId}`,
+            });
           }
-          unitPrice += Number(addon.priceDelta) * addonInput.quantity;
+          unitPrice +=
+            Number(addon.priceDelta) * addonInput.quantity;
           addonPayload.push({
             addonId: addon.id,
             quantity: addonInput.quantity,
@@ -406,26 +420,67 @@ app.get('/public/orders/:id', async (req: Request, res: Response) => {
 });
 
 // Update order status (staff use)
-app.patch('/admin/orders/:id/status', async (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  const { status } = req.body as { status: 'PENDING' | 'ACCEPTED' | 'IN_KITCHEN' | 'SERVED' | 'CLOSED' | 'CANCELLED' };
+app.patch(
+  '/admin/orders/:id/status',
+  async (req: Request, res: Response) => {
+    const id = Number(req.params.id);
+    const { status } = req.body as {
+      status:
+        | 'PENDING'
+        | 'ACCEPTED'
+        | 'IN_KITCHEN'
+        | 'SERVED'
+        | 'CLOSED'
+        | 'CANCELLED';
+    };
 
-  if (Number.isNaN(id)) {
-    return res.status(400).json({ error: 'Invalid order id' });
+    if (Number.isNaN(id)) {
+      return res.status(400).json({ error: 'Invalid order id' });
+    }
+    if (!status) {
+      return res.status(400).json({ error: 'status is required' });
+    }
+
+    try {
+      const order = await prisma.order.update({
+        where: { id },
+        data: { status },
+      });
+
+      res.json({ id: order.id, status: order.status });
+    } catch (err) {
+      console.error('Error updating order status:', err);
+      res.status(500).json({ error: 'Internal server error' });
+    }
   }
-  if (!status) {
-    return res.status(400).json({ error: 'status is required' });
-  }
+);
+
+// List orders by status for staff
+app.get('/admin/orders', async (req: Request, res: Response) => {
+  const status = (req.query.status as string) || 'PENDING';
 
   try {
-    const order = await prisma.order.update({
-      where: { id },
-      data: { status },
+    const orders = await prisma.order.findMany({
+      where: { status },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        table: true,
+        restaurant: true,
+      },
     });
 
-    res.json({ id: order.id, status: order.status });
+    res.json(
+      orders.map((o) => ({
+        id: o.id,
+        status: o.status,
+        total: o.total,
+        createdAt: o.createdAt,
+        tableName: o.table.name,
+        restaurantName: o.restaurant.name,
+      }))
+    );
   } catch (err) {
-    console.error('Error updating order status:', err);
+    console.error('Error listing orders:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

@@ -8,6 +8,7 @@ export default defineConfig({
   // Where migrations will be stored
   migrations: {
     path: 'prisma/migrations',
+    seed: './node_modules/.bin/ts-node prisma/seed.ts',
   },
 
   // Datasource URL now lives here, not in schema.prisma
